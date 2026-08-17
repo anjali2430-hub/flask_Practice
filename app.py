@@ -1,65 +1,87 @@
-from flask import Flask, render_template, request, redirect, url_for
-from flask_pymongo import PyMongo
+from flask import Flask, render_template, request, redirect, url_for, jsonify
+from pymongo import MongoClient
 from bson.objectid import ObjectId
-from dotenv import load_dotenv
-import certifi
 import os
 
-# Load env vars
-load_dotenv()
-
 app = Flask(__name__)
-app.config["MONGO_URI"] = os.getenv("MONGO_URI")
-app.secret_key = os.getenv("SECRET_KEY")
 
-# Use certifi CA bundle explicitly for cross-platform TLS reliability
-# (notably fixes common macOS certificate verification failures).
-mongo = PyMongo(app, tlsCAFile=certifi.where())
+# MongoDB connection
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
+client = MongoClient(MONGO_URI)
+db = client["student_db"]
+students_collection = db["students"]
 
-# Home page -> list students
-@app.route('/')
+
+# ──────────────────────────────────────────────
+# Health / status endpoint (required by pipeline)
+# ──────────────────────────────────────────────
+@app.route("/health")
+def health():
+    """
+    Deploy-verification gate used by the CI/CD pipeline.
+    Returns 200 + JSON when the app AND MongoDB are reachable.
+    Returns 503 if MongoDB is down so the pipeline can detect a bad deploy.
+    """
+    try:
+        # ping forces an actual round-trip to MongoDB
+        client.admin.command("ping")
+        return jsonify({
+            "status": "healthy",
+            "database": "connected"
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "status": "unhealthy",
+            "database": "unreachable",
+            "error": str(e)
+        }), 503
+
+
+# ──────────────────────────────────────────────
+# Existing application routes (unchanged)
+# ──────────────────────────────────────────────
+@app.route("/")
 def index():
-    students = mongo.db.students.find()
-    return render_template('index.html', students=students)
+    students = list(students_collection.find())
+    return render_template("index.html", students=students)
 
-# Add student
-@app.route('/add', methods=['GET', 'POST'])
+
+@app.route("/add", methods=["GET", "POST"])
 def add_student():
-    if request.method == 'POST':
-        name = request.form['name']
-        email = request.form['email']
-        course = request.form['course']
-        mongo.db.students.insert_one({
-            "name": name,
-            "email": email,
-            "course": course
-        })
-        return redirect(url_for('index'))
-    return render_template('add_student.html')
+    if request.method == "POST":
+        name = request.form.get("name")
+        age = request.form.get("age")
+        grade = request.form.get("grade")
+        if name and age and grade:
+            students_collection.insert_one({
+                "name": name,
+                "age": int(age),
+                "grade": grade
+            })
+            return redirect(url_for("index"))
+    return render_template("add_student.html")
 
-# Update student
-@app.route('/update/<student_id>', methods=['GET', 'POST'])
+
+@app.route("/update/<student_id>", methods=["GET", "POST"])
 def update_student(student_id):
-    student = mongo.db.students.find_one({"_id": ObjectId(student_id)})
-    if request.method == 'POST':
-        new_name = request.form['name']
-        new_email = request.form['email']
-        new_course = request.form['course']
-        mongo.db.students.update_one(
+    student = students_collection.find_one({"_id": ObjectId(student_id)})
+    if request.method == "POST":
+        name = request.form.get("name")
+        age = request.form.get("age")
+        grade = request.form.get("grade")
+        students_collection.update_one(
             {"_id": ObjectId(student_id)},
-            {"$set": {"name": new_name, "email": new_email, "course": new_course}}
+            {"$set": {"name": name, "age": int(age), "grade": grade}}
         )
-        return redirect(url_for('index'))
-    return render_template('update_student.html', student=student)
+        return redirect(url_for("index"))
+    return render_template("update_student.html", student=student)
 
 
-# Delete student
-@app.route('/delete/<student_id>')
+@app.route("/delete/<student_id>")
 def delete_student(student_id):
-    mongo.db.students.delete_one({"_id": ObjectId(student_id)})
-    return redirect(url_for('index'))
-
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", debug=True, port=5000)
+    students_collection.delete_one({"_id": ObjectId(student_id)})
+    return redirect(url_for("index"))
 
 
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)
