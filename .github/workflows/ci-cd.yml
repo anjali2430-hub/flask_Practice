@@ -1,0 +1,173 @@
+name: CI/CD Pipeline - Flask Student App
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ── Stage 1: Checkout ─────────────────────────────────────────────────
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # ── Stage 2: Install dependencies ─────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── Stage 3: Test (gate — pipeline stops here if any test fails) ───────
+      - name: Run pytest suite
+        id: test
+        run: pytest test_app.py -v
+
+      # ── Stage 4: Build Docker image tagged with commit SHA ─────────────────
+      - name: Build Docker image
+        id: build
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          docker build -t ${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG .
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      # ── Stage 5: Push to ECR ───────────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image to ECR
+        id: push
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          docker push ${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG
+          echo "Pushed image: ${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG"
+
+      # ── Stage 6 & 7: Deploy to EC2 + Health check ─────────────────────────
+      - name: Deploy to EC2 and verify health
+        id: deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            IMAGE_TAG=${{ github.sha }}
+            FULL_IMAGE=${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG
+
+            # Authenticate EC2 to ECR using the attached IAM role
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | \
+              docker login --username AWS --password-stdin ${{ secrets.ECR_REGISTRY }}
+
+            # Pull new image
+            docker pull $FULL_IMAGE
+
+            # Stop and remove the old container if running
+            docker stop flask-app 2>/dev/null || true
+            docker rm flask-app 2>/dev/null || true
+
+            # Run new container
+            docker run -d \
+              --name flask-app \
+              --restart unless-stopped \
+              -p 5000:5000 \
+              -e MONGO_URI="${{ secrets.MONGO_URI }}" \
+              $FULL_IMAGE
+
+            # Wait for app to start
+            sleep 10
+
+            # Health check — this is the real deploy-verification gate
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5000/health)
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "Health check failed! HTTP status: $HTTP_STATUS"
+              docker logs flask-app
+              exit 1
+            fi
+            echo "Health check passed! App is running."
+
+      # ── Stage 8a: Email on SUCCESS ─────────────────────────────────────────
+      - name: Send success email
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_SENDER }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          to: ${{ secrets.EMAIL_RECEIVER }}
+          from: GitHub Actions <${{ secrets.EMAIL_SENDER }}>
+          subject: "✅ SUCCESS: Flask App Deployed - ${{ github.ref_name }} (${{ github.sha }})"
+          body: |
+            ✅ DEPLOYMENT SUCCESSFUL
+
+            Repository : ${{ github.repository }}
+            Branch     : ${{ github.ref_name }}
+            Commit SHA : ${{ github.sha }}
+            Triggered by: ${{ github.actor }}
+
+            Docker Image: ${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}
+            EC2 Target  : ${{ secrets.EC2_HOST }}
+
+            The Flask app is live and the /health endpoint returned 200 OK.
+
+            View pipeline run:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      # ── Stage 8b: Email on FAILURE ─────────────────────────────────────────
+      - name: Determine failed stage
+        if: failure()
+        id: failed_stage
+        run: |
+          if [ "${{ steps.test.outcome }}" == "failure" ]; then
+            echo "stage=TEST" >> $GITHUB_OUTPUT
+          elif [ "${{ steps.build.outcome }}" == "failure" ]; then
+            echo "stage=BUILD" >> $GITHUB_OUTPUT
+          elif [ "${{ steps.push.outcome }}" == "failure" ]; then
+            echo "stage=PUSH TO ECR" >> $GITHUB_OUTPUT
+          elif [ "${{ steps.deploy.outcome }}" == "failure" ]; then
+            echo "stage=DEPLOY TO EC2" >> $GITHUB_OUTPUT
+          else
+            echo "stage=UNKNOWN" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send failure email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_SENDER }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          to: ${{ secrets.EMAIL_RECEIVER }}
+          from: GitHub Actions <${{ secrets.EMAIL_SENDER }}>
+          subject: "❌ FAILED [${{ steps.failed_stage.outputs.stage }}]: Flask App - ${{ github.ref_name }} (${{ github.sha }})"
+          body: |
+            ❌ DEPLOYMENT FAILED
+
+            Failed Stage : ${{ steps.failed_stage.outputs.stage }}
+            Repository   : ${{ github.repository }}
+            Branch       : ${{ github.ref_name }}
+            Commit SHA   : ${{ github.sha }}
+            Triggered by : ${{ github.actor }}
+
+            The pipeline stopped at the ${{ steps.failed_stage.outputs.stage }} stage.
+            Please check the logs immediately to investigate.
+
+            View logs:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
