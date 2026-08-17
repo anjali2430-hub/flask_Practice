@@ -69,7 +69,7 @@ jobs:
             FULL_IMAGE=${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG
 
             # Authenticate EC2 to ECR using the attached IAM role
-            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | \
+            /usr/bin/aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | \
               docker login --username AWS --password-stdin ${{ secrets.ECR_REGISTRY }}
 
             # Pull new image
